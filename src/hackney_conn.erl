@@ -82,6 +82,7 @@
     %% Owner management
     set_owner/2,
     set_owner_async/2,
+    take_ready/2,
     %% Protocol info
     get_protocol/1
 ]).
@@ -574,6 +575,13 @@ verify_socket(Pid) ->
 is_ready(Pid) ->
     gen_statem:call(Pid, is_ready).
 
+%% @doc Atomically take ownership of a connection if it's ready.
+%% Returns {ok, connected} if the connection is ready and ownership transferred,
+%% or {ok, closed} if the connection is closed.
+-spec take_ready(pid(), pid()) -> {ok, connected} | {ok, closed} | {error, term()}.
+take_ready(Pid, NewOwner) ->
+    gen_statem:call(Pid, {take_ready, NewOwner}, 5000).
+
 %% @doc Upgrade a TCP connection to SSL.
 %% This performs an SSL handshake on the existing TCP socket.
 %% After upgrade, the connection is marked as upgraded_ssl and should
@@ -892,6 +900,37 @@ connected({call, From}, is_ready, #conn_data{transport = Transport, socket = Soc
                      [{reply, From, {ok, connected}}]};
                 {error, _} ->
                     {keep_state_and_data, [{reply, From, {ok, closed}}]}
+            end
+    end;
+
+connected({call, From}, {take_ready, _NewOwner}, #conn_data{socket = undefined} = Data) ->
+    %% Socket not connected
+    {next_state, closed, Data, [{reply, From, {ok, closed}}]};
+connected({call, From}, {take_ready, NewOwner}, #conn_data{transport = Transport, socket = Socket,
+                                                           buffer = Buffer, owner_mon = OldMon} = Data) ->
+    %% Stop active-mode delivery before reconciling the socket
+    _ = Transport:setopts(Socket, [{active, false}]),
+    case has_pending_close(Socket) of
+        true ->
+            %% Server closed the connection
+            {next_state, closed, Data#conn_data{socket = undefined},
+             [{reply, From, {ok, closed}}]};
+        false ->
+            case check_socket_health(Transport, Socket) of
+                ok ->
+                    %% Update owner atomically with the readiness check
+                    demonitor(OldMon, [flush]),
+                    NewMon = monitor(process, NewOwner),
+                    Drained = drain_socket_data(Socket),
+                    NewData = Data#conn_data{
+                        owner = NewOwner,
+                        owner_mon = NewMon,
+                        buffer = <<Buffer/binary, Drained/binary>>
+                    },
+                    {keep_state, NewData, [{reply, From, {ok, connected}}]};
+                {error, _} ->
+                    {next_state, closed, Data#conn_data{socket = undefined},
+                     [{reply, From, {ok, closed}}]}
             end
     end;
 

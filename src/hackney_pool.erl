@@ -540,27 +540,11 @@ handle_call({checkout, Key, Requester, Opts}, _From, State) ->
     ?report_trace("pool: checkout request", [{pool, PoolName}, {key, Key},
         {total_in_use, TotalInUse}, {max_conn, MaxConn}]),
 
-    case find_available(Key, Available) of
+    case find_and_take(Key, Available, Requester) of
         {ok, Pid, Available2} ->
-            %% Found an available connection - update owner to new requester
             ?report_debug("pool: reusing connection", [{pool, PoolName}, {pid, Pid}]),
-            case hackney_conn:set_owner(Pid, Requester) of
-                ok ->
-                    InUse2 = maps:put(Pid, Key, InUse),
-                    {reply, {ok, Pid}, State#state{available=Available2, in_use=InUse2}};
-                {error, _} ->
-                    %% #850: the connection closed between is_ready and
-                    %% set_owner (server-side close race). It is already out of
-                    %% Available2; drop it and start a fresh connection rather
-                    %% than crashing the pool on a bad match.
-                    case start_connection(Key, Requester, Opts, State#state{available=Available2}) of
-                        {ok, Pid2, State2} ->
-                            InUse2 = maps:put(Pid2, Key, State2#state.in_use),
-                            {reply, {ok, Pid2}, State2#state{in_use=InUse2}};
-                        {error, Reason} ->
-                            {reply, {error, Reason}, State#state{available=Available2}}
-                    end
-            end;
+            InUse2 = maps:put(Pid, Key, InUse),
+            {reply, {ok, Pid}, State#state{available=Available2, in_use=InUse2}};
         none ->
             %% No pooled connection available. Per-host concurrency is already
             %% capped by hackney_load_regulation, so start a connection even
@@ -585,22 +569,13 @@ handle_call({checkout_ssl, SslKey, Requester, Opts}, _From, State) ->
     ?report_trace("pool: checkout_ssl request", [{pool, PoolName}, {key, SslKey},
         {total_in_use, maps:size(InUse)}]),
 
-    case find_available_ssl(SslKey, Available) of
+    case find_and_take(SslKey, Available, Requester) of
+        %% Found a pooled SSL connection with the same TLS options hash
         {ok, Pid, Available2} ->
-            %% Found a pooled SSL connection with the same TLS options hash
             ?report_debug("pool: reusing ssl connection", [{pool, PoolName}, {pid, Pid}]),
-            case hackney_conn:set_owner(Pid, Requester) of
-                ok ->
-                    InUse2 = maps:put(Pid, SslKey, InUse),
-                    {reply, {ok, Pid, ready},
-                     State#state{available=Available2, in_use=InUse2}};
-                {error, _} ->
-                    %% #850: the connection closed between is_ready and
-                    %% set_owner. It is already out of Available2; fall back
-                    %% to the TCP bucket with the dead conn dropped.
-                    checkout_ssl_fallback(SslKey, Requester, Opts,
-                                          State#state{available=Available2})
-            end;
+            InUse2 = maps:put(Pid, SslKey, InUse),
+            {reply, {ok, Pid, ready},
+             State#state{available=Available2, in_use=InUse2}};
         none ->
             checkout_ssl_fallback(SslKey, Requester, Opts, State)
     end;
@@ -898,7 +873,7 @@ stop_conn(Pid) ->
 %% is handed out; a closed conn is stopped and dropped (never reanimated). Fresh
 %% dialing for an empty bucket is the caller's `none' branch, off the pool's hot
 %% path. The SSL alias exists only to mark intent at the SSL checkout site.
-find_available(Key, Available) ->
+find_and_take(Key, Available, Requester) ->
     case maps:find(Key, Available) of
         {ok, [Pid | Rest]} ->
             Available2 = case Rest of
@@ -908,37 +883,28 @@ find_available(Key, Available) ->
             %% Verify connection is still alive and usable
             case is_process_alive(Pid) of
                 true ->
-                    %% is_ready checks both state and socket health in one call.
-                    %% The connection can die between is_process_alive/1 above
-                    %% and this gen_statem call (flaky network); the resulting
-                    %% noproc exit must not crash the pool, so skip and move on.
-                    try hackney_conn:is_ready(Pid) of
+                    try hackney_conn:take_ready(Pid, Requester) of
                         {ok, connected} ->
                             {ok, Pid, Available2};
-                        _ ->
-                            %% Closed or unusable: discard it rather than redial
-                            %% from inside the pool. Reanimating a closed pid would
-                            %% break the "only keepalive conns are reused" invariant
-                            %% and a redial here would block the pool on connect.
+                        {ok, closed} ->
+                            %% Connection closed - discard it and continue
                             stop_conn(Pid),
-                            find_available(Key, Available2)
+                            find_and_take(Key, Available2, Requester);
+                        {error, _} ->
+                            stop_conn(Pid),
+                            find_and_take(Key, Available2, Requester)
                     catch
-                        _:_ -> find_available(Key, Available2)
+                        _:_ ->
+                            find_and_take(Key, Available2, Requester)
                     end;
                 false ->
-                    find_available(Key, Available2)
+                    find_and_take(Key, Available2, Requester)
             end;
         {ok, []} ->
             none;
         error ->
             none
     end.
-
-%% @private SSL-bucket variant. Now identical to find_available/2 (closed conns
-%% are always dropped, never redialed); kept as a named alias to mark intent at
-%% the SSL checkout site.
-find_available_ssl(Key, Available) ->
-    find_available(Key, Available).
 
 %% @private SSL checkout miss: reuse or dial a TCP connection for the caller
 %% to upgrade. It is recorded in in_use under the SSL key so the checkin
@@ -950,18 +916,11 @@ checkout_ssl_fallback(SslKey, Requester, Opts, State) ->
     TcpKey = connection_key(Host, Port, hackney_tcp),
     TotalInUse = maps:size(InUse),
 
-    case find_available(TcpKey, Available) of
+    case find_and_take(TcpKey, Available, Requester) of
         {ok, Pid, Available2} ->
-            case hackney_conn:set_owner(Pid, Requester) of
-                ok ->
-                    InUse2 = maps:put(Pid, SslKey, InUse),
-                    {reply, {ok, Pid, needs_upgrade},
-                     State#state{available=Available2, in_use=InUse2}};
-                {error, _} ->
-                    %% #850 race again: drop the dead conn and dial fresh
-                    start_ssl_checkout_conn(SslKey, Requester, Opts,
-                                            State#state{available=Available2})
-            end;
+            InUse2 = maps:put(Pid, SslKey, InUse),
+            {reply, {ok, Pid, needs_upgrade},
+             State#state{available=Available2, in_use=InUse2}};
         none ->
             %% No pooled TCP connection. Per-host concurrency is already capped
             %% by hackney_load_regulation, so start one even at max_connections:
@@ -1050,9 +1009,9 @@ do_checkin(Pid, State) ->
                     %% One call fetches every flag the decision needs. A failed
                     %% checkin_info means we cannot prove the conn keepalive/ready,
                     %% so treat it as not poolable (close) rather than pooling blind.
-                    Poolable = case checkin_info(Pid) of
-                        {ok, Info} -> checkin_poolable(Key, Info);
-                        error -> false
+                    Poolable = case hackney_conn:checkin_info(Pid) of
+                        Info when is_map(Info) -> checkin_poolable(Key, Info);
+                        _ -> false
                     end,
                     case Poolable andalso pool_has_idle_room(State) of
                         true ->
@@ -1087,14 +1046,6 @@ checkin_poolable(_TcpKey, Info) ->
     maps:get(no_reuse, Info, false) =:= false andalso
         maps:get(upgraded_ssl, Info, false) =:= false andalso
         keepalive_ready(Info).
-
-%% @private Fetch the conn's checkin flags, or `error' if the call fails (the
-%% conn died between is_process_alive/1 and here). Caller treats `error' as
-%% not poolable.
-checkin_info(Pid) ->
-    try {ok, hackney_conn:checkin_info(Pid)}
-    catch _:_ -> error
-    end.
 
 %% @private Shared keepalive/readiness gate for checkin: only pool a conn whose
 %% response left it reusable and whose socket is proven ready. Defaults are the
