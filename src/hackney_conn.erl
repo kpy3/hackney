@@ -1972,7 +1972,8 @@ handle_common({call, From}, checkin_info, _State, Data) ->
 handle_common({call, From}, get_protocol, _State, #conn_data{protocol = Protocol}) ->
     {keep_state_and_data, [{reply, From, Protocol}]};
 
-handle_common({call, From}, _, _State, _Data) ->
+handle_common({call, From}, Cmd, State, Data) ->
+    ok = logger:debug("Unknown command ~p in state ~p, data ~p", [Cmd, State, Data]),
     {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
 
 %% QUIC socket ready - drive event loop (common handler for all states)
